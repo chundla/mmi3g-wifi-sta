@@ -11,21 +11,29 @@
 #   install <dir>    from a directory holding the files below (each checked
 #                    against its sum) into /mnt/persistence/wifi-sta; SUMS
 #                    is written last. Completes a set of which some files
-#                    are already this build's (an upgrade)
+#                    are already this build's, and replaces an earlier
+#                    build's (an upgrade); the configuration stays
 #   conf             the hotspot's wpa_supplicant configuration, from stdin,
 #                    into wpa-hotspot.conf there (root, mode 600). It is
 #                    checked as sta-mode.sh checks it, and never printed
-#   hook             append one line to the OpenSSH start-up
-#                    (/mnt/persistence/openssh/start.sh) that runs
-#                    sta-boot.sh in the background; first writes
+#   hook             add a marked five-line block to the factory start-up
+#                    (/mnt/efs-system/lsd/lsd.sh), after the shebang or after
+#                    the OpenSSH installation's block, that runs the launcher
+#                    /mnt/efs-persist/wifi-sta-boot.sh (boot-launch.sh) in the
+#                    background. First keeps a copy of lsd.sh and writes
 #                    /mnt/efs-persist/wifi-sta-rollback.sh, which takes the
-#                    line out again, and keeps a copy of start.sh here
-#   unhook           run that rollback
+#                    block and the launcher out again
+#   unhook           run that rollback. An older build's rollback, which
+#                    takes its line out of the OpenSSH start-up
+#                    (/mnt/persistence/openssh/start.sh), lives at the same
+#                    path; unhook, then hook, moves the start-up to lsd.sh
 #   remove           take all of it out again, the configuration included;
 #                    refused while hooked
 #
-# Nothing factory is changed. Even when hooked, sta-boot.sh starts nothing
-# unless the GEM's "Start-up: join the hotspot" button has left its marker.
+# hook changes the one factory file, and only by that block. Even when
+# hooked, sta-boot.sh starts nothing unless the GEM's "Start-up: join the
+# hotspot" button has left its marker. The OpenSSH installation is optional:
+# without it the station has no SSH and starts its own jitter-egd.
 # Refuses while station mode is running. A dropped SSH session (HUP) does not
 # stop it.
 # Exit: 0 done, 1 usage, 2 refused or failed.
@@ -40,26 +48,51 @@ top=$persistence/wifi-sta
 sums=$top/SUMS
 conf=$top/wpa-hotspot.conf
 conf_owner=root
-# What sta-mode.sh needs besides these files; the OpenSSH installation
-# provides both (docs/access/openssh-persistent.md).
+# The OpenSSH installation (qnx632-openssh), which gives the station SSH,
+# and its start-up, which an older build's hook changed.
 sshd=/mnt/ssh/sbin/sshd
 openssh_start=$persistence/openssh/start.sh
 # sta-mode.sh's lock: station mode is running.
 sta_lock=/fs/tmpfs/mmi-sta/lock
-# name, mode, cksum. The binaries are the ones the 7.3 run used.
+# name, mode, cksum. The binaries are the ones the 7.3 run used; jitter-egd
+# is qnx632-openssh's, byte for byte.
 files='devn-mv8688sta.so 700 3938534867 64931
 mv8688-ctl 700 3277080864 11450
 mv8688-probe 700 2747790827 77195
 sd8688_helper.bin 600 1538620194 2616
 sd8688.bin 600 251454034 259172
 wpa_supplicant 700 2366746706 491332
-sta-mode.sh 700 2913500418 43139
-sta-boot.sh 700 1916130123 3248'
-# The start-up line, its rollback and the copy of start.sh before it.
-hook_line='[ ! -x /mnt/persistence/wifi-sta/sta-boot.sh ] || (/bin/ksh /mnt/persistence/wifi-sta/sta-boot.sh > /fs/tmpfs/wifi-sta-boot.out 2>&1 &) || :'
+jitter-egd 700 2336099037 35856
+sta-mode.sh 700 3337595432 45937
+sta-boot.sh 700 4201762923 4507
+boot-launch.sh 700 898658748 853'
+# Earlier builds' sums of files this build replaces: an install upgrades
+# them, and remove takes them out as its own.
+older='sta-mode.sh 2913500418 43139
+sta-boot.sh 1916130123 3248'
+# The start-up block in the factory lsd.sh, the launcher it runs, the copy
+# of lsd.sh before it and the rollback. The launcher is on efs-persist, as
+# the OpenSSH installation's is: the HDD may not be mounted yet.
+efs_system=/mnt/efs-system
+lsd=$efs_system/lsd/lsd.sh
+efs_persist=/mnt/efs-persist
+launcher=$efs_persist/wifi-sta-boot.sh
+lsd_pre=$efs_persist/wifi-sta-lsd.sh.pre
+block_begin='# BEGIN MMI WIFI-STA'
+block_end='# END MMI WIFI-STA'
+block="$block_begin
+if [ -r /mnt/efs-persist/wifi-sta-boot.sh ]; then
+    (trap '' 1; exec /bin/ksh /mnt/efs-persist/wifi-sta-boot.sh > /dev/shmem/wifi-sta-boot.log 2>&1) &
+fi
+$block_end"
+openssh_end='# END MMI OPENSSH'
+min_flash_kb=64
 rollback=/mnt/efs-persist/wifi-sta-rollback.sh
-pre_hook=$top/start.sh.pre-wifi-sta
 marker=/mnt/efs-persist/wifi-sta/gem/client-at-start-up
+# An older build's start-up line in the OpenSSH start-up, and the copy of
+# start.sh it kept.
+old_hook_line='[ ! -x /mnt/persistence/wifi-sta/sta-boot.sh ] || (/bin/ksh /mnt/persistence/wifi-sta/sta-boot.sh > /fs/tmpfs/wifi-sta-boot.out 2>&1 &) || :'
+pre_hook=$top/start.sh.pre-wifi-sta
 # RAM: gone after a restart.
 run=/fs/tmpfs
 lock=$run/wifi-sta-install.lock
@@ -100,6 +133,13 @@ pin_of() {
     echo "$files" | while read -r n m s z; do
         [ "$n" = "$1" ] && echo "$s $z"
     done
+}
+
+# Whether "<cksum> <bytes>" $2 is an earlier build's name $1.
+is_older() {
+    echo "$older" | while read -r n s z; do
+        [ "$n" = "$1" ] && [ "$s $z" = "$2" ] && echo yes
+    done | grep -q yes
 }
 
 mode_of() {
@@ -143,16 +183,19 @@ put() {
 }
 
 # The station files, as one word: absent, installed (SUMS and every file
-# match), partial (some of this build's files) or other.
+# match), partial (some of this build's files), older (some an earlier
+# build's) or other.
 state_of() {
     so_s=
     for n in $(names); do
         if [ ! -f "$top/$n" ]; then so_s=${so_s}a
         elif [ "$(sum_of "$top/$n")" = "$(pin_of "$n")" ]; then so_s=${so_s}i
+        elif is_older "$n" "$(sum_of "$top/$n")"; then so_s=${so_s}o
         else so_s=${so_s}x; fi
     done
     case $so_s in
         *x*) echo other ;;
+        *o*) echo older ;;
         *i*a*|*a*i*) echo partial ;;
         *a*) if [ -f "$sums" ]; then echo partial; else echo absent; fi ;;
         *) if [ "$(sums_text)" = "$(cat "$sums" 2>/dev/null)" ]; then
@@ -188,7 +231,8 @@ remove_ours() {
     [ ! -f "$sums" ] || { say "could not remove $sums"; remove_rc=1; }
     for n in $(names); do
         [ -f "$top/$n" ] || continue
-        if [ "$(sum_of "$top/$n")" = "$(pin_of "$n")" ]; then
+        if [ "$(sum_of "$top/$n")" = "$(pin_of "$n")" ] ||
+                is_older "$n" "$(sum_of "$top/$n")"; then
             rm -f "$top/$n"
         else
             say "$top/$n is not this build's ($(sum_of "$top/$n")); left in place"
@@ -238,8 +282,18 @@ status() {
     else
         say "$top: absent"
     fi
-    if [ -x "$sshd" ]; then say "$sshd: present"; else say "$sshd: ABSENT"; fi
-    if hooked; then say "start-up line: in $openssh_start"; else say "start-up line: absent"; fi
+    if [ -x "$sshd" ]; then
+        say "OpenSSH: $sshd present (SSH over the hotspot)"
+    else
+        say "OpenSSH: absent (no SSH over the hotspot; the station starts its own jitter-egd)"
+    fi
+    if hooked; then
+        say "start-up block: in $lsd"
+    elif old_hooked; then
+        say "start-up line: in $openssh_start (an older build's; unhook, then hook, to move it)"
+    else
+        say "start-up block: absent"
+    fi
     if [ -f "$marker" ]; then say "start-up mode: hotspot client"; else say "start-up mode: car access point"; fi
     if [ -f "$top/boot.log" ]; then say "last boot.log line: $(sed -n '$p' "$top/boot.log")"; fi
     if [ -d "$sta_lock" ]; then say "station mode: running"; else say "station mode: not running"; fi
@@ -257,13 +311,11 @@ install() {
     not_running
     state=$(state_of)
     case $state in
-        absent|partial) ;;
+        absent|partial|older) ;;
         installed) say "already installed from this build"; return 0 ;;
         *) fail "the files are $state; remove them first" ;;
     esac
     [ -d "$persistence" ] || fail "$persistence is absent (the HDD is not mounted)"
-    [ -f "$openssh_start" ] && [ -x "$sshd" ] ||
-        fail "the OpenSSH installation ($openssh_start, $sshd) is missing; the station's SSH needs it"
     free=$(free_kb "$persistence")
     case $free in
         ''|*[!0-9]*) fail "cannot read the free space of $persistence" ;;
@@ -285,6 +337,7 @@ install() {
         mv -f "$sums.new.$$" "$sums" || fail "could not write $sums"
     [ "$(state_of)" = installed ] || fail "the files are not as installed"
     txn=none
+    [ -x "$sshd" ] || say "no OpenSSH installation ($sshd): the station will have no SSH."
     if conf_ok "$conf"; then
         say "installed; wpa-hotspot.conf is already there."
     else
@@ -311,61 +364,102 @@ conf_in() {
 }
 
 hooked() {
-    [ -f "$openssh_start" ] && grep -q -x -F -- "$hook_line" "$openssh_start"
+    [ -f "$lsd" ] && grep -q -x -F -- "$block_begin" "$lsd"
+}
+
+old_hooked() {
+    [ -f "$openssh_start" ] && grep -q -x -F -- "$old_hook_line" "$openssh_start"
+}
+
+# lsd.sh without our block, as "<cksum> <bytes>" (of a copy in RAM: cksum
+# reads files here, never a pipe).
+lsd_without_block() {
+    lwb=$run/wifi-sta-lsd.check.$$
+    sed -e "/^$block_begin\$/,/^$block_end\$/d" "$lsd" > "$lwb" && sum_of "$lwb"
+    rm -f "$lwb"
 }
 
 hook() {
     take_lock
     [ "$(state_of)" = installed ] || fail "the station files are not installed"
-    [ -f "$openssh_start" ] || fail "$openssh_start is missing"
+    old_hooked && fail "an older build's start-up line is in $openssh_start; run unhook first"
     if hooked; then
+        [ "$(sum_of "$launcher")" = "$(pin_of boot-launch.sh)" ] ||
+            fail "$lsd has the block, but $launcher is not this build's; run unhook, then hook"
         say "already hooked"
         return 0
     fi
-    ! grep -q 'sta-boot\.sh' "$openssh_start" ||
-        fail "$openssh_start names sta-boot.sh in another line; not changing it"
-    pre_sum=$(sum_of "$openssh_start")
-    cp -p "$openssh_start" "$pre_hook" && [ "$(sum_of "$pre_hook")" = "$pre_sum" ] ||
-        fail "could not keep a copy of $openssh_start"
-    # The rollback first, outside the HDD payload.
+    [ -f "$lsd" ] || fail "$lsd is missing"
+    [ "$(sed -n 1p "$lsd")" = '#!/bin/ksh' ] ||
+        fail "$lsd does not begin with #!/bin/ksh; not changing it"
+    ! grep -q -i -e 'wifi-sta' -e 'sta-boot' "$lsd" ||
+        fail "$lsd already names the Wi-Fi station; not changing it"
+    /bin/ksh -n "$lsd" 2>/dev/null || fail "$lsd does not parse as it is; not changing it"
+    for d in "$efs_system" "$efs_persist"; do
+        free=$(free_kb "$d")
+        case $free in
+            ''|*[!0-9]*) fail "cannot read the free space of $d" ;;
+        esac
+        [ "$free" -ge "$min_flash_kb" ] || fail "$d has only ${free} KB free, needs $min_flash_kb"
+    done
+    # The factory start-up remounts it read-write; this only makes sure.
+    mount -uw "$efs_system" 2>/dev/null || :
+    pre_sum=$(sum_of "$lsd")
+    cp -p "$lsd" "$lsd_pre" && [ "$(sum_of "$lsd_pre")" = "$pre_sum" ] ||
+        fail "could not keep a copy of $lsd"
+    # After the OpenSSH installation's block, so SSH is launched first;
+    # otherwise straight after the shebang.
+    at=$(sed -n "/^$openssh_end\$/=" "$lsd" | sed -n 1p)
+    [ -n "$at" ] || at=1
+    # The rollback first, outside the HDD payload. It takes out the launcher
+    # first: the block does nothing without it.
     {
         echo '#!/bin/ksh'
-        echo '# Written by sta-install.sh hook. Takes the Wi-Fi station line out of'
-        echo '# the OpenSSH start-up again and clears the GEM start-up marker.'
-        echo "start=$openssh_start"
-        echo "line='$hook_line'"
-        echo "pre_sum='$pre_sum'"
+        echo '# Written by sta-install.sh hook. Takes the Wi-Fi station block out of'
+        echo '# the factory lsd.sh again, with its launcher and the GEM start-up marker.'
+        echo "efs_system=$efs_system"
+        echo "lsd=$lsd"
+        echo "launcher=$launcher"
         echo "marker=$marker"
+        echo "begin='$block_begin'"
+        echo "end='$block_end'"
+        echo "pre_sum='$pre_sum'"
         cat <<'ROLLBACK'
 set -u
 PATH=/bin:/sbin:/usr/bin:/usr/sbin
 export PATH
-rm -f "$marker"
-if ! grep -q -x -F -- "$line" "$start"; then
-    echo "wifi-sta rollback: no start-up line in $start; the marker is gone."
+rm -f "$launcher" "$marker"
+if ! grep -q -x -F -- "$begin" "$lsd"; then
+    echo "wifi-sta rollback: no start-up block in $lsd; the launcher and the marker are gone."
     exit 0
 fi
-new=$start.new.$$
-cp -p "$start" "$new" && grep -v -x -F -- "$line" "$start" > "$new" &&
-    /bin/ksh -n "$new" && mv -f "$new" "$start" ||
-    { rm -f "$new"; echo "wifi-sta rollback: FAIL: $start unchanged" >&2; exit 2; }
-set -- $(cksum "$start")
+mount -uw "$efs_system" 2>/dev/null || :
+new=$lsd.wifi-sta-new.$$
+cp -p "$lsd" "$new" && sed -e "/^$begin\$/,/^$end\$/d" "$lsd" > "$new" &&
+    /bin/ksh -n "$new" && mv -f "$new" "$lsd" ||
+    { rm -f "$new"; echo "wifi-sta rollback: FAIL: $lsd unchanged; the launcher is gone, so the block does nothing" >&2; exit 2; }
+set -- $(cksum "$lsd")
 if [ "$1 $2" = "$pre_sum" ]; then
-    echo "wifi-sta rollback: start-up line removed; $start is as before the hook ($pre_sum)."
+    echo "wifi-sta rollback: start-up block removed; $lsd is as before the hook ($pre_sum)."
 else
-    echo "wifi-sta rollback: start-up line removed; $start is $1 $2, not $pre_sum as before the hook (changed since)."
+    echo "wifi-sta rollback: start-up block removed; $lsd is $1 $2, not $pre_sum as before the hook (changed since)."
 fi
 ROLLBACK
     } > "$rollback.new.$$" && chmod 700 "$rollback.new.$$" &&
         /bin/ksh -n "$rollback.new.$$" && mv -f "$rollback.new.$$" "$rollback" ||
         { rm -f "$rollback.new.$$"; fail "could not write $rollback"; }
-    new=$openssh_start.new.$$
-    { cp -p "$openssh_start" "$new" && cat "$openssh_start" > "$new" &&
-        echo "$hook_line" >> "$new" && /bin/ksh -n "$new"; } ||
-        { rm -f "$new"; fail "could not prepare the new $openssh_start; unchanged"; }
-    mv -f "$new" "$openssh_start" || { rm -f "$new"; fail "could not replace $openssh_start"; }
-    hooked || fail "the line is not in $openssh_start; run $rollback"
-    say "hooked: $openssh_start $pre_sum -> $(sum_of "$openssh_start"); copy $pre_hook; rollback $rollback."
+    put "$top/boot-launch.sh" "$launcher" 700 "$(pin_of boot-launch.sh)" ||
+        fail "could not install $launcher"
+    new=$lsd.wifi-sta-new.$$
+    { cp -p "$lsd" "$new" &&
+        { sed -n "1,${at}p" "$lsd" && echo "$block" && sed -e "1,${at}d" "$lsd"; } > "$new" &&
+        /bin/ksh -n "$new"; } ||
+        { rm -f "$new"; fail "could not prepare the new $lsd; unchanged"; }
+    mv -f "$new" "$lsd" || { rm -f "$new"; fail "could not replace $lsd"; }
+    hooked || fail "the block is not in $lsd; run $rollback"
+    [ "$(lsd_without_block)" = "$pre_sum" ] ||
+        fail "$lsd differs by more than the block; run $rollback"
+    say "hooked: $lsd $pre_sum -> $(sum_of "$lsd") (after line $at); copy $lsd_pre; launcher $launcher; rollback $rollback."
     say "Nothing starts until the GEM's \"Start-up: join the hotspot\" is pressed."
 }
 
@@ -374,12 +468,15 @@ unhook() {
     if [ -f "$rollback" ]; then
         /bin/ksh "$rollback" || fail "the rollback failed"
     elif hooked; then
+        fail "$rollback is missing; take the block out of $lsd by hand"
+    elif old_hooked; then
         fail "$rollback is missing; take the line out of $openssh_start by hand"
     else
-        rm -f "$marker"
+        rm -f "$marker" "$launcher"
         say "not hooked"
     fi
-    hooked && fail "the line is still in $openssh_start"
+    hooked && fail "the block is still in $lsd"
+    old_hooked && fail "the line is still in $openssh_start"
     return 0
 }
 
@@ -387,7 +484,7 @@ remove() {
     take_lock
     not_running
     state=$(state_of)
-    hooked && fail "the start-up line is still in $openssh_start; run unhook first"
+    { hooked || old_hooked; } && fail "the start-up is still hooked; run unhook first"
     if [ "$state" = absent ] && [ ! -f "$conf" ]; then
         say "nothing is installed"
     else
@@ -396,7 +493,7 @@ remove() {
         [ ! -f "$conf" ] || fail "could not remove $conf"
         say "removed (was $state), with the configuration."
     fi
-    rm -f "$top/boot.log" "$top/boot.log.old" "$pre_hook" "$rollback"
+    rm -f "$top/boot.log" "$top/boot.log.old" "$pre_hook" "$rollback" "$launcher" "$lsd_pre"
     if [ -d "$top" ]; then
         rmdir "$top" 2>/dev/null || say "$top is not empty; left in place"
     fi

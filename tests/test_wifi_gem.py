@@ -31,10 +31,13 @@ INSTALL = ROOT / 'wifi-sta/gem-install.sh'
 STA_INSTALL = ROOT / 'wifi-sta/sta-install.sh'
 STA_MODE = ROOT / 'wifi-sta/sta-mode.sh'
 STA_BOOT = ROOT / 'wifi-sta/sta-boot.sh'
+BOOT_LAUNCH = ROOT / 'wifi-sta/boot-launch.sh'
 BUILD = ROOT / 'work/build'
 # A saved copy of the unit's factory efs-system/engdefs, if you have one.
 SAVED_ENGDEFS = Path(os.environ.get('MMI_SAVED_ENGDEFS', '/nonexistent'))
 GEM_DIR = '/mnt/efs-persist/wifi-sta/gem'
+# The first published build, whose hook was a line in the OpenSSH start-up.
+FIRST_BUILD = '23b4255'
 
 
 def cksum(path):
@@ -586,7 +589,19 @@ class StationInstaller(Base):
     the real ones.
     """
     NAMES = ('devn-mv8688sta.so', 'mv8688-ctl', 'mv8688-probe', 'sd8688_helper.bin',
-             'sd8688.bin', 'wpa_supplicant')
+             'sd8688.bin', 'wpa_supplicant', 'jitter-egd')
+    SCRIPTS = ('sta-mode.sh', 'sta-boot.sh', 'boot-launch.sh')
+    # The factory lsd.sh's first lines, after the OpenSSH installation's hook.
+    LSD = ('#!/bin/ksh\n# BEGIN MMI OPENSSH\n'
+           'if [ -r /mnt/efs-persist/openssh-start.sh ]; then\n'
+           "    (trap '' 1; exec /bin/ksh /mnt/efs-persist/openssh-start.sh > "
+           '/dev/shmem/mmi-openssh-boot.log 2>&1) &\nfi\n# END MMI OPENSSH\n'
+           '(sleep 120 && route add -net 10.1 10.0.96.1) &\n'
+           'mount -uw /mnt/efs-persist\n')
+    BLOCK = ('# BEGIN MMI WIFI-STA\n'
+             'if [ -r /mnt/efs-persist/wifi-sta-boot.sh ]; then\n'
+             "    (trap '' 1; exec /bin/ksh /mnt/efs-persist/wifi-sta-boot.sh > "
+             '/dev/shmem/wifi-sta-boot.log 2>&1) &\nfi\n# END MMI WIFI-STA\n')
     CONF = ('network={\n\tssid="hotspot-ssid"\n\tkey_mgmt=WPA-PSK\n'
             '\tpsk="secret-passphrase"\n}\n')
 
@@ -610,10 +625,10 @@ class StationInstaller(Base):
             (self.stage / n).write_bytes(f'stand-in {n}\n'.encode())
             mode = '600' if n.endswith('.bin') else '700'
             lines.append(f'{n} {mode} {cksum(self.stage / n)}')
-        (self.stage / 'sta-mode.sh').write_bytes(STA_MODE.read_bytes())
-        (self.stage / 'sta-boot.sh').write_bytes(STA_BOOT.read_bytes())
-        lines.append(f"sta-mode.sh 700 {cksum(STA_MODE)}")
-        lines.append(f"sta-boot.sh 700 {cksum(STA_BOOT)}'")
+        for n, source in zip(self.SCRIPTS, (STA_MODE, STA_BOOT, BOOT_LAUNCH)):
+            (self.stage / n).write_bytes(source.read_bytes())
+            lines.append(f'{n} 700 {cksum(source)}')
+        lines[-1] += "'"
         self.openssh_start = openssh / 'start.sh'
         self.openssh_start.write_text('#!/bin/ksh\necho "OpenSSH ready"\n')
         self.openssh_start.chmod(0o700)
@@ -621,7 +636,15 @@ class StationInstaller(Base):
         (self.efs_persist / 'wifi-sta' / 'gem').mkdir(parents=True)
         self.marker = self.efs_persist / 'wifi-sta/gem/client-at-start-up'
         self.rollback = self.efs_persist / 'wifi-sta-rollback.sh'
+        self.launcher = self.efs_persist / 'wifi-sta-boot.sh'
+        self.lsd_pre = self.efs_persist / 'wifi-sta-lsd.sh.pre'
+        self.efs_system = b / 'efs-system'
+        (self.efs_system / 'lsd').mkdir(parents=True)
+        self.lsd = self.efs_system / 'lsd/lsd.sh'
+        self.lsd.write_text(self.LSD)
+        self.lsd.chmod(0o755)
         self.top = self.persistence / 'wifi-sta'
+        self.tool('mount', '#!/bin/sh\necho "mount $*" >> "$0.calls"\n')
         self.tool('df', '#!/bin/sh\necho "Filesystem 1K-blocks Used Available Use% Mounted"\n'
                         'echo "/dev/hd0t77 300000 100000 ${MOCK_FREE:-160000} 40% $1"\n')
         text = STA_INSTALL.read_text()
@@ -637,6 +660,8 @@ class StationInstaller(Base):
             ('/bin/ksh -n', 'dash -n'),
             ('/bin/ksh "$rollback"', 'dash "$rollback"'),
             ('rollback=/mnt/efs-persist/wifi-sta-rollback.sh', f'rollback={self.rollback}'),
+            ('efs_system=/mnt/efs-system', f'efs_system={self.efs_system}'),
+            ('efs_persist=/mnt/efs-persist', f'efs_persist={self.efs_persist}'),
             ('marker=/mnt/efs-persist/wifi-sta/gem/client-at-start-up', f'marker={self.marker}'),
             ('PATH=/bin:/sbin:/usr/bin:/usr/sbin', f'PATH={self.bin}:/bin:/usr/bin')),
             'sta-install.sh')
@@ -651,14 +676,13 @@ class StationInstaller(Base):
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertIn('Next: sta-install.sh conf', out.stdout)
         self.assertEqual(self.top.stat().st_mode & 0o777, 0o700)
-        for n in self.NAMES + ('sta-mode.sh', 'sta-boot.sh'):
+        for n in self.NAMES + self.SCRIPTS:
             self.assertEqual((self.top / n).read_bytes(), (self.stage / n).read_bytes())
             want = 0o600 if n.endswith('.bin') else 0o700
             self.assertEqual((self.top / n).stat().st_mode & 0o777, want, n)
         sums = (self.top / 'SUMS').read_text().splitlines()
-        self.assertEqual([line.split()[2] for line in sums],
-                         list(self.NAMES) + ['sta-mode.sh', 'sta-boot.sh'])
-        self.assertEqual(sums[-2], f'{cksum(STA_MODE)} sta-mode.sh')
+        self.assertEqual([line.split()[2] for line in sums], list(self.NAMES + self.SCRIPTS))
+        self.assertEqual(sums[-3], f'{cksum(STA_MODE)} sta-mode.sh')
         self.assertFalse((self.run_dir / 'wifi-sta-install.lock').exists())
         self.assertIn('already installed', self.run_script('install', str(self.stage)).stdout)
 
@@ -713,13 +737,14 @@ class StationInstaller(Base):
             self.assertIn('station mode is running', out.stdout)
         self.assertFalse(self.top.exists())
 
-    def test_refuses_without_the_openssh_installation_or_space(self):
+    def test_installs_without_the_openssh_installation(self):
         self.sshd.unlink()
         out = self.run_script('install', str(self.stage))
-        self.assertEqual(out.returncode, 2)
-        self.assertIn('OpenSSH installation', out.stdout)
-        self.sshd.write_text('')
-        self.sshd.chmod(0o755)
+        self.assertEqual(out.returncode, 0, out.stdout)
+        self.assertIn('the station will have no SSH', out.stdout)
+        self.assertIn('OpenSSH: absent', self.run_script('status').stdout)
+
+    def test_refuses_too_little_space(self):
         out = self.run_script('install', str(self.stage), MOCK_FREE='100')
         self.assertIn('needs 2048', out.stdout)
         self.assertFalse(self.top.exists())
@@ -773,26 +798,32 @@ class StationInstaller(Base):
         self.assertIn('wpa-hotspot.conf is already there', out.stdout)
         self.assertIn('state: installed', self.run_script('status').stdout)
 
+    def rollback_alone(self):
+        return subprocess.run(['dash', str(self.rollback)], capture_output=True, text=True,
+                              timeout=60, env={'PATH': f'{self.bin}:/usr/bin:/bin'})
+
     def test_hook_and_unhook(self):
-        original = self.openssh_start.read_bytes()
+        original = self.lsd.read_bytes()
         self.assertEqual(self.run_script('hook').returncode, 2)  # nothing installed
-        self.assertEqual(self.openssh_start.read_bytes(), original)
+        self.assertEqual(self.lsd.read_bytes(), original)
         self.assertEqual(self.run_script('install', str(self.stage)).returncode, 0)
         out = self.run_script('hook')
         self.assertEqual(out.returncode, 0, out.stdout)
         self.assertIn('Nothing starts until', out.stdout)
-        lines = self.openssh_start.read_text().splitlines()
-        self.assertEqual(lines[-1], '[ ! -x /mnt/persistence/wifi-sta/sta-boot.sh ] || '
-                         '(/bin/ksh /mnt/persistence/wifi-sta/sta-boot.sh > '
-                         '/fs/tmpfs/wifi-sta-boot.out 2>&1 &) || :')
-        self.assertEqual(self.openssh_start.read_text().count('sta-boot.sh'), 2)
-        self.assertEqual(self.openssh_start.stat().st_mode & 0o777, 0o700)
-        self.assertEqual((self.top / 'start.sh.pre-wifi-sta').read_bytes(), original)
+        self.assertIn('(after line 6)', out.stdout)
+        # After the OpenSSH block, the factory lines untouched.
+        lines = self.LSD.splitlines(keepends=True)
+        self.assertEqual(self.lsd.read_text(), ''.join(lines[:6]) + self.BLOCK + ''.join(lines[6:]))
+        self.assertEqual(self.lsd.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(self.lsd_pre.read_bytes(), original)
+        self.assertEqual(self.launcher.read_bytes(), BOOT_LAUNCH.read_bytes())
+        self.assertEqual(self.launcher.stat().st_mode & 0o777, 0o700)
         self.assertEqual(self.rollback.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(self.openssh_start.read_text(), '#!/bin/ksh\necho "OpenSSH ready"\n')
         self.assertIn('already hooked', self.run_script('hook').stdout)
-        self.assertEqual(self.openssh_start.read_text().count('sta-boot.sh'), 2)
+        self.assertEqual(self.lsd.read_text().count('BEGIN MMI WIFI-STA'), 1)
         status = self.run_script('status').stdout
-        self.assertIn('start-up line: in', status)
+        self.assertIn('start-up block: in', status)
         self.assertIn('start-up mode: car access point', status)
 
         out = self.run_script('remove')
@@ -802,40 +833,178 @@ class StationInstaller(Base):
         out = self.run_script('unhook')
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertIn('is as before the hook', out.stdout)
-        self.assertEqual(self.openssh_start.read_bytes(), original)
-        self.assertEqual(self.openssh_start.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(self.lsd.read_bytes(), original)
+        self.assertEqual(self.lsd.stat().st_mode & 0o777, 0o755)
         self.assertFalse(self.marker.exists())
+        self.assertFalse(self.launcher.exists())
         self.assertEqual(self.run_script('remove').returncode, 0)
         self.assertFalse(self.rollback.exists())
+        self.assertFalse(self.lsd_pre.exists())
         self.assertFalse(self.top.exists())
+
+    def test_without_the_openssh_block_the_block_follows_the_shebang(self):
+        self.lsd.write_text('#!/bin/ksh\nVMOPTIONS="$VMOPTIONS -DshowScreenInfo"\n')
+        self.assertEqual(self.run_script('install', str(self.stage)).returncode, 0)
+        out = self.run_script('hook')
+        self.assertEqual(out.returncode, 0, out.stdout)
+        self.assertEqual(self.lsd.read_text(), '#!/bin/ksh\n' + self.BLOCK +
+                         'VMOPTIONS="$VMOPTIONS -DshowScreenInfo"\n')
 
     def test_the_rollback_works_without_the_installer(self):
         self.assertEqual(self.run_script('install', str(self.stage)).returncode, 0)
-        original = self.openssh_start.read_bytes()
+        original = self.lsd.read_bytes()
         self.assertEqual(self.run_script('hook').returncode, 0)
-        # Another change to start.sh after the hook: only our line goes.
-        with self.openssh_start.open('a') as f:
+        # Another change to lsd.sh after the hook: only our block goes.
+        with self.lsd.open('a') as f:
             f.write('echo later\n')
-        out = subprocess.run(['dash', str(self.rollback)], capture_output=True, text=True,
-                             timeout=60, env={'PATH': '/usr/bin:/bin'})
+        out = self.rollback_alone()
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn('changed since', out.stdout)
-        self.assertEqual(self.openssh_start.read_bytes(), original + b'echo later\n')
-        again = subprocess.run(['dash', str(self.rollback)], capture_output=True, text=True,
-                               timeout=60, env={'PATH': '/usr/bin:/bin'})
-        self.assertIn('no start-up line', again.stdout)
+        self.assertEqual(self.lsd.read_bytes(), original + b'echo later\n')
+        self.assertFalse(self.launcher.exists())
+        self.assertIn('no start-up block', self.rollback_alone().stdout)
 
-    def test_hook_refuses_a_start_up_that_already_names_sta_boot(self):
+    def test_a_rollback_that_cannot_write_lsd_still_disarms_the_block(self):
         self.assertEqual(self.run_script('install', str(self.stage)).returncode, 0)
-        self.openssh_start.write_text('#!/bin/ksh\n# sta-boot.sh by hand\n')
+        self.assertEqual(self.run_script('hook').returncode, 0)
+        self.rollback.write_text(self.rollback.read_text().replace('dash -n "$new"', 'false'))
+        out = self.rollback_alone()
+        self.assertEqual(out.returncode, 2)
+        self.assertIn('the block does nothing', out.stderr)
+        self.assertIn('BEGIN MMI WIFI-STA', self.lsd.read_text())
+        self.assertFalse(self.launcher.exists())
+
+    def test_hook_refuses_an_lsd_sh_it_does_not_recognise(self):
+        self.assertEqual(self.run_script('install', str(self.stage)).returncode, 0)
+        for text, why in (('#!/bin/sh\necho\n', 'does not begin with'),
+                          (self.LSD + '# sta-boot.sh by hand\n', 'already names'),
+                          (self.LSD + 'if then\n', 'does not parse')):
+            self.lsd.write_text(text)
+            out = self.run_script('hook')
+            self.assertEqual(out.returncode, 2, why)
+            self.assertIn(why, out.stdout)
+            self.assertEqual(self.lsd.read_text(), text)
+            self.assertFalse(self.rollback.exists())
+            self.assertFalse(self.launcher.exists())
+        self.lsd.write_text(self.LSD)
+        out = self.run_script('hook', MOCK_FREE='10')
+        self.assertIn('needs 64', out.stdout)
+        self.assertEqual(self.lsd.read_text(), self.LSD)
+
+    def first_build(self):
+        """The first published build's sta-install.sh, run as on the unit
+        after 7.6, with its own sta-mode.sh and sta-boot.sh."""
+        shown = {}
+        for name in ('sta-install.sh', 'sta-mode.sh', 'sta-boot.sh'):
+            out = subprocess.run(['git', '-C', str(ROOT), 'show', f'{FIRST_BUILD}:wifi-sta/{name}'],
+                                 capture_output=True)
+            if out.returncode != 0:
+                self.skipTest('not a git checkout with the first build')
+            shown[name] = out.stdout
+        stage = self.base / 'stage-first'
+        stage.mkdir()
+        lines = []
+        for n in self.NAMES[:-1] + ('sta-mode.sh', 'sta-boot.sh'):
+            source = self.stage / n if n in self.NAMES else None
+            (stage / n).write_bytes(source.read_bytes() if source else shown[n])
+            lines.append(f'{n} {"600" if n.endswith(".bin") else "700"} {cksum(stage / n)}')
+        text = shown['sta-install.sh'].decode()
+        files_at = text.index("files='") + len("files='")
+        text = text[:files_at] + '\n'.join(lines) + text[text.index("'", files_at):]
+        for original, replacement in (
+                ('persistence=/mnt/persistence', f'persistence={self.persistence}'),
+                ('sshd=/mnt/ssh/sbin/sshd', f'sshd={self.sshd}'),
+                ('sta_lock=/fs/tmpfs/mmi-sta/lock', f'sta_lock={self.run_dir}/mmi-sta/lock'),
+                ('run=/fs/tmpfs', f'run={self.run_dir}'),
+                ('conf_owner=root', f'conf_owner={getpass.getuser()}'),
+                ('/bin/ksh -n', 'dash -n'),
+                ('rollback=/mnt/efs-persist/wifi-sta-rollback.sh', f'rollback={self.rollback}'),
+                ('marker=/mnt/efs-persist/wifi-sta/gem/client-at-start-up', f'marker={self.marker}'),
+                ('PATH=/bin:/sbin:/usr/bin:/usr/sbin', f'PATH={self.bin}:/bin:/usr/bin')):
+            self.assertIn(original, text)
+            text = text.replace(original, replacement)
+        script = self.base / 'first-sta-install.sh'
+        script.write_text(text)
+        # The new build must know the first build's scripts.
+        for n in ('sta-mode.sh', 'sta-boot.sh'):
+            self.assertIn(f'{n} {cksum(stage / n)}', STA_INSTALL.read_text())
+
+        def run(*args, stdin=None):
+            return subprocess.run(['dash', str(script), *args], capture_output=True, text=True,
+                                  timeout=60, input=stdin, env={'PATH': '/usr/bin:/bin'})
+        for args, stdin in ((('install', str(stage)), None), (('conf',), self.CONF), (('hook',), None)):
+            out = run(*args, stdin=stdin)
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+
+    def test_an_older_build_is_upgraded_and_its_start_up_moved_to_lsd_sh(self):
+        before = self.openssh_start.read_bytes()
+        self.first_build()
+        self.assertIn('sta-boot.sh', self.openssh_start.read_text())
+        status = self.run_script('status').stdout
+        self.assertIn('state: older', status)
+        self.assertIn('an older build', status)
+
+        out = self.run_script('install', str(self.stage))
+        self.assertEqual(out.returncode, 0, out.stdout)
+        self.assertIn('(older)', out.stdout)
+        self.assertIn('wpa-hotspot.conf is already there', out.stdout)
+        self.assertEqual((self.top / 'wpa-hotspot.conf').read_text(), self.CONF)
+        self.assertIn('state: installed', self.run_script('status').stdout)
+
         out = self.run_script('hook')
         self.assertEqual(out.returncode, 2)
-        self.assertIn('another line', out.stdout)
-        self.assertFalse(self.rollback.exists())
+        self.assertIn('run unhook first', out.stdout)
+        self.assertEqual(self.lsd.read_text(), self.LSD)
+        self.assertEqual(self.run_script('remove').returncode, 2)
+        out = self.run_script('unhook')
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn('is as before the hook', out.stdout)
+        self.assertEqual(self.openssh_start.read_bytes(), before)
+        out = self.run_script('hook')
+        self.assertEqual(out.returncode, 0, out.stdout)
+        self.assertIn('BEGIN MMI WIFI-STA', self.lsd.read_text())
+        self.assertIn('start-up block: in', self.run_script('status').stdout)
+
+    def test_remove_takes_out_an_older_builds_files(self):
+        self.first_build()
+        self.assertEqual(self.run_script('unhook').returncode, 0)
+        out = self.run_script('remove')
+        self.assertEqual(out.returncode, 0, out.stdout)
+        self.assertFalse(self.top.exists())
 
     def test_usage(self):
         for args in ([], ['install'], ['conf', 'x'], ['hook', 'x'], ['purge']):
             self.assertEqual(self.run_script(*args).returncode, 1, args)
+
+
+class Launcher(Base):
+    """boot-launch.sh, which the lsd.sh block runs."""
+
+    def setUp(self):
+        super().setUp()
+        self.boot_script = self.base / 'sta-boot.sh'
+        self.script = self.patched(BOOT_LAUNCH, (
+            ('boot=/mnt/persistence/wifi-sta/sta-boot.sh', f'boot={self.boot_script}'),
+            ('limit=180', 'limit=10'),
+            ('exec /bin/ksh "$boot"', 'exec dash "$boot"'),
+            ('PATH=/bin:/sbin:/usr/bin:/usr/sbin', f'PATH={self.bin}:/bin:/usr/bin')),
+            'boot-launch.sh')
+
+    def launch(self):
+        return subprocess.run(['dash', str(self.script)], capture_output=True, text=True,
+                              timeout=60, env={'PATH': '/usr/bin:/bin',
+                                               'LD_PRELOAD': '/usr/lib/libmc.so'})
+
+    def test_runs_sta_boot_without_the_preload(self):
+        self.boot_script.write_text('echo "boot ran preload=${LD_PRELOAD-unset}"\n')
+        out = self.launch()
+        self.assertEqual(out.returncode, 0)
+        self.assertEqual(out.stdout, 'boot ran preload=unset\n')
+
+    def test_without_the_hdd_it_gives_up(self):
+        out = self.launch()
+        self.assertEqual(out.returncode, 0)
+        self.assertIn('after 10s', out.stdout)
 
 
 class StartUp(Base):
@@ -851,6 +1020,9 @@ class StartUp(Base):
         self.run_dir = b / 'run'
         self.run_dir.mkdir()
         self.marker = self.gem / 'client-at-start-up'
+        self.openssh = b / 'openssh'
+        self.openssh.mkdir()
+        self.openssh_run = self.run_dir / 'mmi-openssh'
         self.sta = self.home / 'sta-mode.sh'
         self.sta.write_text('echo "sta: $1 preload=${LD_PRELOAD-unset}"\n'
                             'echo "sta: verdict OK"\necho ran > "$0.ran"\n')
@@ -866,6 +1038,10 @@ class StartUp(Base):
             ('gem=/mnt/efs-persist/wifi-sta/gem', f'gem={self.gem}'),
             ('run=/fs/tmpfs', f'run={self.run_dir}'),
             ('uap0_limit=300', 'uap0_limit=10'),
+            ('openssh=/mnt/persistence/openssh', f'openssh={self.openssh}'),
+            ('openssh_disabled=/mnt/efs-persist/openssh.disabled',
+             f'openssh_disabled={self.gem}/openssh.disabled'),
+            ('openssh_limit=300', 'openssh_limit=10'),
             ('/bin/ksh "$home/sta-mode.sh" start', 'dash "$home/sta-mode.sh" start'),
             ('PATH=/bin:/sbin:/usr/bin:/usr/sbin', f'PATH={self.bin}:/bin:/usr/bin')),
             'sta-boot.sh')
@@ -917,6 +1093,42 @@ class StartUp(Base):
         self.assertIn('    sta: verdict OK', log)
         self.assertIn('sta-mode.sh start exit 0', log)
 
+    def openssh_installed(self, up):
+        (self.openssh / 'INSTALL_READY').write_text('OpenSSH\n')
+        self.openssh_run.mkdir()
+        if up:
+            for name in ('sshd.pid', 'entropy.pid'):
+                (self.openssh_run / name).write_text(f'{os.getpid()}\n')
+
+    def test_waits_for_the_openssh_installation(self):
+        self.marker.write_text('')
+        self.openssh_installed(up=True)
+        log = self.boot()
+        self.assertIn('OpenSSH is up (waited 0s)', log)
+        self.assertTrue(self.started())
+
+    def test_an_openssh_start_up_still_running_is_waited_for(self):
+        self.marker.write_text('')
+        self.openssh_installed(up=True)
+        (self.openssh_run / 'start.lock').mkdir()
+        log = self.boot()
+        self.assertIn('OpenSSH is not up after 10s; starting without it', log)
+        self.assertTrue(self.started())
+
+    def test_an_openssh_that_never_starts_does_not_stop_the_station(self):
+        self.marker.write_text('')
+        self.openssh_installed(up=False)
+        self.assertIn('OpenSSH is not up after 10s', self.boot())
+        self.assertTrue(self.started())
+
+    def test_a_disabled_openssh_is_not_waited_for(self):
+        self.marker.write_text('')
+        self.openssh_installed(up=False)
+        (self.gem / 'openssh.disabled').write_text('disabled\n')
+        log = self.boot()
+        self.assertNotIn('OpenSSH', log)
+        self.assertTrue(self.started())
+
     def test_the_log_keeps_one_older_generation(self):
         self.log.write_text('x' * 40000)
         self.boot()
@@ -933,9 +1145,10 @@ class StationPins(unittest.TestCase):
 
     def test_the_files_are_those_sta_mode_needs(self):
         self.assertEqual(sorted(self.pins()),
-                         sorted(StationInstaller.NAMES + ('sta-mode.sh', 'sta-boot.sh')))
+                         sorted(StationInstaller.NAMES + StationInstaller.SCRIPTS))
         self.assertEqual(self.pins()['sta-mode.sh'], cksum(STA_MODE))
         self.assertEqual(self.pins()['sta-boot.sh'], cksum(STA_BOOT))
+        self.assertEqual(self.pins()['boot-launch.sh'], cksum(BOOT_LAUNCH))
 
     def test_the_local_builds_match_the_pins(self):
         # The binaries the 7.3 run used; present only on the workstation
@@ -943,6 +1156,7 @@ class StationPins(unittest.TestCase):
         local = {'devn-mv8688sta.so': BUILD / 'devn-mv8688sta.so',
                  'mv8688-ctl': BUILD / 'mv8688-ctl', 'mv8688-probe': BUILD / 'mv8688-probe',
                  'wpa_supplicant': BUILD / 'wpa/wpa_supplicant',
+                 'jitter-egd': ROOT / 'openssh/work/jitter-build/jitter-egd',
                  'sd8688_helper.bin': ROOT / 'work/firmware/sd8688_helper.bin',
                  'sd8688.bin': ROOT / 'work/firmware/sd8688.bin'}
         if not all(path.is_file() for path in local.values()):
@@ -956,7 +1170,7 @@ class UnitUtilities(unittest.TestCase):
         # Checked on the unit on 2026-10-28/29: no wc, nohup, tail, head or
         # printf; its grep has no -o; its date has no +%s. The saved images
         # have no id or env either.
-        for path in (GEM, INSTALL, STA_INSTALL, STA_BOOT):
+        for path in (GEM, INSTALL, STA_INSTALL, STA_BOOT, BOOT_LAUNCH):
             body = code_lines(path)
             for absent in (' wc ', 'nohup', '| tail', '| head', 'printf', '+%s',
                            '$(id', ' env ', 'mkdir -p'):
@@ -966,7 +1180,7 @@ class UnitUtilities(unittest.TestCase):
     def test_no_bare_argument_list(self):
         # The unit's ksh rejects an empty "$@" under set -u; only bounded()
         # takes it, and it always has a command.
-        for path in (GEM, INSTALL, STA_INSTALL, STA_BOOT):
+        for path in (GEM, INSTALL, STA_INSTALL, STA_BOOT, BOOT_LAUNCH):
             bare = [line.strip() for line in path.read_text().splitlines()
                     if '"$@"' in line and '${1+"$@"}' not in line]
             self.assertEqual(bare, ['"$@" > "$bounded_out" 2>&1 < /dev/null &']

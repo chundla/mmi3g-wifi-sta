@@ -21,6 +21,11 @@
 # After the start, a keeper stays in the background until the restart (or a
 # stop). Every 10 s it restarts wpa_supplicant or dhcp.client if one has
 # exited, and keeps an sshd and the en6 SSH rule bound to the current lease.
+# The sshd is the OpenSSH installation's (qnx632-openssh) and runs only while
+# that installation is running; without it the station has no SSH. The
+# supplicant's random source, jitter-egd, is that installation's when it
+# runs; otherwise the start runs the copy beside the station files, which
+# stays until the restart.
 # It never touches uap0: there is no restore watchdog, and a failure after
 # the detach leaves no access point until the restart.
 #
@@ -57,6 +62,11 @@ ssh_label=mmi_sta_ssh
 ssh_port=2222
 sshd=/mnt/ssh/sbin/sshd
 sshd_template=/mnt/ssh/etc/sshd_config
+passwd_file=/etc/passwd
+# The EGD port wpa_supplicant reads its random bytes from, and how long a
+# jitter-egd may take to report ready (as the OpenSSH start-up allows).
+egd_port=708
+egd_limit=65
 dhcp_client=/usr/sbin/dhcp.client
 dhcp_client_sum='263280565 57048'
 dhcp_up=/etc/dhcp/dhcp-up
@@ -389,10 +399,17 @@ preflight() {
     for f in "$sta_driver" "$helper" "$image"; do
         [ -f "$f" ] && [ -s "$f" ] || refuse "$f is missing or empty."
     done
-    for f in "$ctl" "$probe" "$wpa_bin" "$dhcp_client" "$sshd"; do
+    for f in "$ctl" "$probe" "$wpa_bin" "$dhcp_client"; do
         [ -f "$f" ] && [ -x "$f" ] || refuse "$f is missing or not executable."
     done
-    [ -s "$sshd_template" ] || refuse "$sshd_template is missing."
+    # SSH over the hotspot needs the OpenSSH installation running: its sshd,
+    # its configuration and the sshd account its start-up maps into
+    # /etc/passwd.
+    if [ -x "$sshd" ] && [ -s "$sshd_template" ] && grep -q '^sshd:' "$passwd_file" 2>/dev/null; then
+        ssh=yes
+    else
+        ssh=no
+    fi
     [ "$(sum_of "$driver")" = "$driver_sum" ] ||
         refuse "$driver is not the reviewed factory object ($(sum_of "$driver"))."
     [ "$(sum_of "$dhcp_client")" = "$dhcp_client_sum" ] ||
@@ -440,8 +457,13 @@ preflight() {
     fi
     bounded 20 "$state/pidin.txt" pidin -f aA ||
         refuse "pidin did not answer; cannot check jitter-egd or dhcp.client."
-    grep -q 'jitter-egd' "$state/pidin.txt" ||
-        refuse "jitter-egd is not running; wpa_supplicant would have no random bytes. Rerun /mnt/persistence/openssh/start.sh first."
+    if grep -q 'jitter-egd' "$state/pidin.txt"; then
+        egd=running
+    elif [ -f "$egd_bin" ] && [ -x "$egd_bin" ]; then
+        egd=start
+    else
+        refuse "jitter-egd is not running and $egd_bin is missing; wpa_supplicant would have no random bytes."
+    fi
     ! sed -n 's/^ *[0-9][0-9]* //p' "$state/pidin.txt" | grep -q "dhcp\.client .* -i $sta_if *\$" ||
         refuse "a dhcp.client for $sta_if is already running."
     pfctl -sr > "$state/pf.check" 2>&1 || refuse "pfctl -sr failed: $(cat "$state/pf.check")"
@@ -530,11 +552,18 @@ cmd_start() {
     helper=$root/sd8688_helper.bin
     image=$root/sd8688.bin
     wpa_bin=$root/wpa_supplicant
+    egd_bin=$root/jitter-egd
     preflight
     for f in "$sta_driver" "$ctl" "$probe" "$helper" "$image" "$wpa_bin"; do
         say "$f cksum $(sum_of "$f")"
     done
-    say "uap0 factory MAC $ap_mac goes to the station; no default route; jitter-egd is running."
+    if [ "$egd" = running ]; then
+        say "uap0 factory MAC $ap_mac goes to the station; no default route; jitter-egd is running."
+    else
+        say "uap0 factory MAC $ap_mac goes to the station; no default route; jitter-egd starts from $egd_bin."
+    fi
+    [ "$ssh" = yes ] ||
+        say "the OpenSSH installation is not running: the station will have no SSH."
     client=$(session_client)
     case $client in
         192.168.1.*) say "this session arrives on uap0 ($client): it will drop at the detach. Reconnect over the hotspot (port $ssh_port on the lease address) and run status.";;
@@ -547,7 +576,7 @@ cmd_start() {
     fi
     # mkdir is atomic: of two starts, one gets the lock.
     mkdir "$lock" 2>/dev/null || { say "another start holds $lock."; exit 2; }
-    for f in sta_driver ctl probe helper image wpa_bin conf ap_mac; do
+    for f in sta_driver ctl probe helper image wpa_bin conf ap_mac ssh egd egd_bin; do
         eval "echo \"\$$f\"" > "$lock/$f"
     done
     echo starting > "$state/phase"
@@ -564,7 +593,7 @@ cmd_start() {
 
 # --- start: the work (detached) -------------------------------------------------
 load_lock() {
-    for f in sta_driver ctl probe helper image wpa_bin conf ap_mac; do
+    for f in sta_driver ctl probe helper image wpa_bin conf ap_mac ssh egd egd_bin; do
         eval "$f=\$(cat \"\$lock/\$f\" 2>/dev/null)"
     done
 }
@@ -589,6 +618,30 @@ wpa_start() {
     log "wpa_supplicant started on $sta_if (pid $!) with $conf (not logged)."
 }
 
+# The station's own random source, when the OpenSSH installation's is not
+# running, started as that installation's start-up starts it. It is left
+# running after a stop, until the restart.
+egd_start() {
+    rm -f "$state/egd.log"
+    ( trap '' 1; exec "$egd_bin" "$egd_port" ) < /dev/null > "$state/egd.log" 2>&1 &
+    echo $! > "$state/egd.pid"
+    eg_waited=0
+    until grep -q '^JITTER_EGD_READY ' "$state/egd.log" 2>/dev/null; do
+        if ! alive "$state/egd.pid"; then
+            log "jitter-egd from $egd_bin exited: $(sed -n '$p' "$state/egd.log" 2>/dev/null)"
+            return 1
+        fi
+        if [ "$eg_waited" -ge "$egd_limit" ]; then
+            log "jitter-egd from $egd_bin was not ready after ${egd_limit}s."
+            stop_pid "$state/egd.pid" jitter-egd 5
+            return 1
+        fi
+        sleep 1
+        eg_waited=$((eg_waited + 1))
+    done
+    log "jitter-egd: started from $egd_bin on port $egd_port (pid $(cat "$state/egd.pid"))."
+}
+
 worker_start() {
     load_lock
     log "start: uap0 factory MAC $ap_mac; unit clock $(date '+%Y-%m-%dT%H:%M:%S') (uptime, not calendar time)."
@@ -603,6 +656,13 @@ worker_start() {
     else
         : > "$state/resolv.conf.absent"
         log "resolv.conf before the start: absent."
+    fi
+    if [ "$egd" = start ] && ! egd_start; then
+        rm -rf "$lock"
+        rm -f "$state/phase"
+        log "no random source for wpa_supplicant; nothing was changed."
+        verdict FAIL
+        exit 2
     fi
     if sta_pf_enable; then
         log "pf: $sta_if admits only DHCP replies until a lease (label $pf_label)."
@@ -711,7 +771,7 @@ converge() {
     changed lease "$lease" && log "lease: ${lease:-none}"
     if [ -n "$lease" ]; then
         bound=$(cat "$state/bound" 2>/dev/null)
-        if [ "$bound" != "$lease" ] || ! alive "$state/sshd.pid"; then
+        if [ "$ssh" = yes ] && { [ "$bound" != "$lease" ] || ! alive "$state/sshd.pid"; }; then
             if [ "$bound" != "$lease" ] && [ "$(cat "$state/bind.failed" 2>/dev/null)" = "$lease" ] &&
                     [ $((ticks - bind_tried)) -lt 6 ]; then
                 :
@@ -766,8 +826,10 @@ start_checks() {
         bounded 5 "$state/getconf.txt" getconf _CS_RESOLVE
         ! grep -q 'nameserver' "$state/getconf.txt" || missing="$missing _CS_RESOLVE not cleared;"
         nat_present || missing="$missing no NAT on $sta_if;"
-        [ "$(cat "$state/bound" 2>/dev/null)" = "$lease" ] && alive "$state/sshd.pid" ||
-            missing="$missing no sshd on the lease;"
+        if [ "$ssh" = yes ]; then
+            [ "$(cat "$state/bound" 2>/dev/null)" = "$lease" ] && alive "$state/sshd.pid" ||
+                missing="$missing no sshd on the lease;"
+        fi
     fi
 }
 
@@ -784,7 +846,12 @@ keeper() {
         if [ ! -f "$state/verdict" ]; then
             start_checks
             if [ -z "$missing" ]; then
-                log "RESULT: $sta_if joined the hotspot with WPA2-PSK, leased ${lease%% *} as the only default route with resolv.conf naming $(echo $sc_servers), translates <natRangeTable>, and sshd listens on ${lease%% *}:$ssh_port."
+                if [ "$ssh" = yes ]; then
+                    sshd_note="and sshd listens on ${lease%% *}:$ssh_port"
+                else
+                    sshd_note="with no SSH (the OpenSSH installation is not running)"
+                fi
+                log "RESULT: $sta_if joined the hotspot with WPA2-PSK, leased ${lease%% *} as the only default route with resolv.conf naming $(echo $sc_servers), translates <natRangeTable>, $sshd_note."
                 verdict OK
             elif [ "$ticks" -ge "$start_ticks" ]; then
                 log "PARTIAL after $((ticks * tick))s:$missing the keeper keeps trying."
@@ -993,7 +1060,9 @@ cmd_status() {
         bad PARTIAL "wpa_supplicant is not running"
     alive "$state/dhcp.pid" && say "dhcp.client: running (pid $(cat "$state/dhcp.pid"))" ||
         bad PARTIAL "dhcp.client is not running"
-    if alive "$state/sshd.pid"; then
+    if [ "$(cat "$lock/ssh" 2>/dev/null)" = no ]; then
+        say "sshd: none (the OpenSSH installation was not running at the start)"
+    elif alive "$state/sshd.pid"; then
         say "sshd: pid $(cat "$state/sshd.pid") on $(cat "$state/bound" 2>/dev/null | sed -e 's/ .*//'):$ssh_port"
         [ "$(cat "$state/bound" 2>/dev/null)" = "${lease:-}" ] || bad PARTIAL "sshd is not on the current lease"
     else

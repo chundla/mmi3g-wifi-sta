@@ -1,9 +1,11 @@
 #!/bin/ksh
 # Phase 7.6: start station mode at start-up, when the engineering screen
 # (GEM) has chosen it. Installed by sta-install.sh beside sta-mode.sh on the
-# HDD, and run in the background by the last line of the OpenSSH start-up
-# (/mnt/persistence/openssh/start.sh), once jitter-egd and the access point's
-# sshd are up. See docs/wifi-client/wifi-client-mode.md, "Station mode at
+# HDD, and run in the background by boot-launch.sh, which the start-up block
+# that sta-install.sh hook adds to the factory lsd.sh starts. When the
+# OpenSSH installation (qnx632-openssh) is there, it waits for that to start
+# its jitter-egd and the access point's sshd first, as it did when the OpenSSH
+# start-up ran it. See docs/wifi-client/wifi-client-mode.md, "Station mode at
 # start-up (7.6)".
 #
 # It does nothing (the access point stays) unless the GEM's "Start-up:
@@ -26,8 +28,16 @@ kill_switch=$gem/start.disabled
 log_file=$home/boot.log
 log_max=32768
 run=/fs/tmpfs
+# The OpenSSH installation, its kill switch and its RAM state, and how long
+# to wait for it: its own launcher gives up within about 215 s of start-up.
+openssh=/mnt/persistence/openssh
+openssh_disabled=/mnt/efs-persist/openssh.disabled
+openssh_run=$run/mmi-openssh
+openssh_limit=300
 # The factory networking service, the en5 hook and the HMI are still
-# starting when the OpenSSH start-up ends.
+# starting when the access point and the OpenSSH start-up are up; with this
+# wait the detach comes when it did in 7.6, about 2.5 minutes after
+# power-on.
 settle=60
 # How long to wait for the access point's factory address.
 uap0_limit=300
@@ -60,6 +70,15 @@ sums_ok() {
     [ "$sums_bad" = 0 ]
 }
 
+# Both of its services run and its start-up has finished.
+openssh_up() {
+    for ou_f in sshd.pid entropy.pid; do
+        ou_pid=$(cat "$openssh_run/$ou_f" 2>/dev/null)
+        [ -n "$ou_pid" ] && kill -0 "$ou_pid" 2>/dev/null || return 1
+    done
+    [ ! -d "$openssh_run/start.lock" ]
+}
+
 trap '' 1
 rotate
 log "start-up, unit clock $(date '+%H:%M:%S') (uptime)"
@@ -71,21 +90,34 @@ if [ -e "$kill_switch" ]; then
     log "the start is disabled ($kill_switch); keeping the access point."
     exit 0
 fi
-log "mode: hotspot client; waiting ${settle}s for the start-up to settle."
-sleep "$settle"
-if ifconfig en5 > /dev/null 2>&1; then
-    log "en5 is present (wired, at home); keeping the access point."
-    exit 0
-fi
+log "mode: hotspot client."
 waited=0
 until ifconfig uap0 2>/dev/null | grep -q "inet $ap_address "; do
     if [ "$waited" -ge "$uap0_limit" ]; then
-        log "uap0 has no $ap_address after ${uap0_limit}s more; not starting."
+        log "uap0 has no $ap_address after ${uap0_limit}s; not starting."
         exit 0
     fi
     sleep 5
     waited=$((waited + 5))
 done
+if [ -f "$openssh/INSTALL_READY" ] && [ ! -e "$openssh_disabled" ]; then
+    waited=0
+    until openssh_up; do
+        if [ "$waited" -ge "$openssh_limit" ]; then
+            log "OpenSSH is not up after ${openssh_limit}s; starting without it."
+            break
+        fi
+        sleep 5
+        waited=$((waited + 5))
+    done
+    [ "$waited" -ge "$openssh_limit" ] || log "OpenSSH is up (waited ${waited}s)."
+fi
+log "waiting ${settle}s for the start-up to settle."
+sleep "$settle"
+if ifconfig en5 > /dev/null 2>&1; then
+    log "en5 is present (wired, at home); keeping the access point."
+    exit 0
+fi
 [ ! -e "$kill_switch" ] && [ -f "$marker" ] ||
     { log "the mode changed while waiting; not starting."; exit 0; }
 sums_ok || { log "not starting."; exit 0; }

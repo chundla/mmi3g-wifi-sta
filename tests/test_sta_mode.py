@@ -84,6 +84,10 @@ class StaMode(unittest.TestCase):
         self.template = base / 'sshd_config'
         self.template.write_text('Port 2222\nListenAddress 192.168.1.1\n'
                                  'PidFile /dev/shmem/mmi-openssh.pid\nAllowUsers root\n')
+        # The OpenSSH start-up's RAM passwd, with its sshd account.
+        self.passwd = base / 'passwd'
+        self.passwd.write_text('root::0:0:Superuser:/mnt/persistence/openssh:/bin/ksh\n'
+                               'sshd:*:15:15:OpenSSH privilege separation:/mnt/ssh/empty:/bin/ksh\n')
         for name in ('devn-mv8688sta.so', 'sd8688_helper.bin', 'sd8688.bin'):
             (self.root / name).write_bytes(name.encode())
         self.conf = self.root / 'wpa-hotspot.conf'
@@ -97,6 +101,7 @@ class StaMode(unittest.TestCase):
                 ('driver=/lib/dll/devnp-mv8688uap.so', f'driver={self.driver}'),
                 ('sshd=/mnt/ssh/sbin/sshd', f'sshd={self.bin}/sshd'),
                 ('sshd_template=/mnt/ssh/etc/sshd_config', f'sshd_template={self.template}'),
+                ('passwd_file=/etc/passwd', f'passwd_file={self.passwd}'),
                 ('dhcp_client=/usr/sbin/dhcp.client', f'dhcp_client={self.bin}/dhcp.client'),
                 ('dhcp_up=/etc/dhcp/dhcp-up', f'dhcp_up={base}/dhcp-up'),
                 ('resolv_conf=/etc/resolv.conf', f'resolv_conf={self.resolv}'),
@@ -464,7 +469,55 @@ while :; do /bin/sleep 0.02; done
         self.assert_refused(self.start(), 'no usable factory MAC')
 
     def test_refuses_without_jitter_egd(self):
-        self.assert_refused(self.start(MOCK_NO_EGD='1'), 'jitter-egd is not running')
+        self.assert_refused(self.start(MOCK_NO_EGD='1'),
+                            'jitter-egd is not running and ' + str(self.root / 'jitter-egd'))
+
+    def bundled_egd(self, ready=True):
+        self.tool('jitter-egd', '''#!/bin/sh
+echo "egd $*" >> "$MOCK_CALLS"
+echo "$$ $0 $*" >> "$MOCK_PIDS"
+''' + ('echo "JITTER_EGD_READY port=$1"\n' if ready else 'echo "jent_entropy_init failed"; exit 1\n') +
+                  '''trap 'exit 0' TERM
+while :; do /bin/sleep 0.02; done
+''', where=self.root)
+
+    def test_without_the_openssh_jitter_egd_the_bundled_one_is_started_first(self):
+        self.bundled_egd()
+        result = self.start(MOCK_NO_EGD='1')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr + self.log())
+        self.assertIn(f'jitter-egd starts from {self.root}/jitter-egd', result.stdout)
+        calls = [c for c in self.recorded().splitlines()
+                 if c.startswith(('egd', 'pfctl -R', 'ifconfig uap0 destroy', 'wpa -'))]
+        self.assertEqual([' '.join(c.split()[:3]) for c in calls][:4],
+                         ['egd 708', 'pfctl -R -f', 'ifconfig uap0 destroy', 'wpa -i en6'])
+        self.assertIn('jitter-egd: started from', self.log())
+        status = self.run_script('status', MOCK_NO_EGD='1')
+        self.assertIn('status OK', status.stdout)
+        # A stop leaves it for the next start.
+        self.assertEqual(self.run_script('stop').returncode, 0, self.log())
+        self.assertTrue(self.alive('egd.pid'))
+
+    def test_a_bundled_jitter_egd_that_fails_keeps_uap0(self):
+        self.bundled_egd(ready=False)
+        result = self.start(MOCK_NO_EGD='1')
+        self.assertEqual(result.returncode, 2, self.log())
+        self.assertIn('jent_entropy_init failed', self.log())
+        self.assertIn('nothing was changed', self.log())
+        self.assertNotIn('destroy', self.recorded())
+        self.assertNotIn('pfctl -R', self.recorded())
+        self.assertFalse((self.state / 'lock').exists())
+
+    def test_without_the_openssh_installation_running_there_is_no_ssh(self):
+        self.passwd.write_text('root::0:0:Superuser:/:/bin/ksh\n')
+        result = self.start()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr + self.log())
+        self.assertIn('the station will have no SSH', result.stdout)
+        self.assertIn('with no SSH (the OpenSSH installation is not running)', self.log())
+        self.assertNotIn('sshd', self.recorded())
+        self.assertNotIn('mmi_sta_ssh', self.pf.read_text())
+        status = self.run_script('status')
+        self.assertIn('sshd: none', status.stdout)
+        self.assertIn('status OK', status.stdout)
 
     def test_refuses_a_configuration_that_is_not_roots_alone_or_names_two_networks(self):
         self.assert_refused(self.start(MOCK_LS_MODE='-rw-r--r--'), 'mode 600')

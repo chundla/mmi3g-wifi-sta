@@ -5861,6 +5861,137 @@ Pass:
 
 Evidence goes to `<private>/live-<date>-phase76/`.
 
+### Start-up from `lsd.sh`, OpenSSH optional (7.7), prepared offline
+
+Prepared on 2026-10-30, after the [7.6 run](#phase-76-results), for a
+packaged install from an MMI3G-Toolkit SD card. Nothing in this section has
+run on the unit.
+
+**Why.** Through 7.6 the station needed the
+[OpenSSH installation](https://github.com/chundla/qnx632-openssh), for three
+things: `jitter-egd`, the `sshd` on the lease, and the start-up line in
+its `start.sh`. A unit without that installation could not run the
+station at all. 7.7 makes all three optional:
+
+- **`jitter-egd`.** `sta-mode.sh start` uses a `jitter-egd` that is
+  already running, as before. If none is running, it starts the copy
+  beside the station files (qnx632-openssh's build, `cksum 2336099037
+  35856`, a ninth pinned file) on port 708. It waits up to 65 s for
+  `JITTER_EGD_READY`, as the OpenSSH start-up does, and it does this
+  before the `pf` rules and the detach. A failure is a `FAIL` with the
+  access point kept. That copy runs until the restart, and a `stop`
+  leaves it running for the next start.
+- **`sshd`.** SSH is used only while the OpenSSH installation is
+  running: `/mnt/ssh/sbin/sshd`, its configuration, and the `sshd`
+  account its start-up adds to the RAM `/etc/passwd`. Otherwise the
+  preflight says "the station will have no SSH", and the keeper loads no
+  SSH rule, so `en6` admits nothing inbound. `OK` then needs no `sshd`,
+  and the result line says "with no SSH".
+- **The start-up hook** moves from OpenSSH's `start.sh` to a marked
+  block in the factory `/mnt/efs-system/lsd/lsd.sh`, as the OpenSSH
+  installation's own hook does:
+
+```sh
+# BEGIN MMI WIFI-STA
+if [ -r /mnt/efs-persist/wifi-sta-boot.sh ]; then
+    (trap '' 1; exec /bin/ksh /mnt/efs-persist/wifi-sta-boot.sh > /dev/shmem/wifi-sta-boot.log 2>&1) &
+fi
+# END MMI WIFI-STA
+```
+
+The block goes after OpenSSH's `# END MMI OPENSSH` line if there is one,
+otherwise straight after the shebang. The launcher
+[`boot-launch.sh`](../../wifi-sta/boot-launch.sh) is on `efs-persist`,
+because the HDD may not be mounted yet when `lsd.sh` runs. It waits up to
+180 s for `sta-boot.sh` on the HDD, then runs it.
+
+**`sta-boot.sh` waits longer now.** It runs about 90 s earlier than in 7.6,
+so it waits for these, in order:
+1. `uap0` with `192.168.1.1`, up to 300 s;
+2. if OpenSSH is installed (`INSTALL_READY`, not disabled): both of its
+   services alive and its start lock gone, up to 300 s. OpenSSH's own
+   launcher gives up within about 215 s;
+3. the 60 s settle;
+4. then the `en5` check, as before.
+
+Step 2 matters for two reasons. Without it, the station could take port
+708 before OpenSSH's `jitter-egd`, and OpenSSH's start-up would then fail.
+Or the detach could come before OpenSSH has seen `uap0`, and it would skip
+its start. With these waits on a unit with OpenSSH, the detach comes when
+it did in 7.6: about a minute after OpenSSH is up. If OpenSSH never comes
+up, as on the cold start of 2026-10-28, the station now starts anyway,
+after 300 s, with its own `jitter-egd` and without SSH. In 7.6 it did not
+start at all then.
+
+**`sta-install.sh hook` changes `lsd.sh`.** It first checks that:
+- `lsd.sh` begins with `#!/bin/ksh`;
+- it parses;
+- it names neither `wifi-sta` nor `sta-boot`;
+- both flash volumes have at least 64 KB free.
+
+Then it does the following, in order:
+1. keeps a copy, `/mnt/efs-persist/wifi-sta-lsd.sh.pre`, and checks the
+   copy's sum;
+2. writes `/mnt/efs-persist/wifi-sta-rollback.sh`;
+3. installs the launcher;
+4. builds the new `lsd.sh` beside it, has `/bin/ksh -n` parse it, and
+   renames it into place;
+5. checks that `lsd.sh` without the block has the sum from before the
+   hook.
+
+The rollback first deletes the launcher and the marker. Without the
+launcher, the block does nothing even if the edit after it fails. It then
+deletes only the lines from `# BEGIN MMI WIFI-STA` to `# END MMI WIFI-STA`.
+It reports whether `lsd.sh` is back to its earlier sum. It never copies a
+whole file back, so a later change to `lsd.sh`, such as an OpenSSH
+reinstall, survives. OpenSSH's own rollback restores the whole
+`lsd.sh.pre-openssh`, so it also takes this block out.
+
+**Upgrading the 7.6 install.** The rollback keeps its path,
+`/mnt/efs-persist/wifi-sta-rollback.sh`, so `unhook` runs the 7.6
+rollback. That takes the line out of `start.sh` (back to `702352968 4246`)
+and deletes the marker. `hook` refuses while that line is in. `install`
+recognises the first build's `sta-mode.sh` (`2913500418 43139`) and
+`sta-boot.sh` (`1916130123 3248`) as `older`, and replaces them in place.
+The configuration stays. The six binaries and the firmware are unchanged.
+So the upgrade is `unhook`, `install`, `hook`, then the marker written
+again if it was there before. The toolkit module's installer does those
+steps.
+
+**Files:**
+- `sta-mode.sh` `3337595432 45937`;
+- `sta-boot.sh` `4201762923 4507`;
+- `boot-launch.sh` `898658748 853`;
+- `sta-install.sh` `948402866 19745`;
+- `gem-install.sh`, `WifiClient.esd`, `gem.sh` and the binaries are
+  unchanged.
+
+Host checks (`tests/test_sta_mode.py`, `tests/test_wifi_gem.py`) cover:
+- the bundled `jitter-egd` started before the rules and the detach, and
+  one that fails keeping `uap0`;
+- the station without the OpenSSH installation: no `sshd`, no SSH rule,
+  status `OK`;
+- the launcher;
+- the OpenSSH wait: installed and up, still starting, never up, disabled;
+- the block after OpenSSH's, and after the shebang;
+- the rollback on its own, with a later change kept, and one that cannot
+  write `lsd.sh`;
+- refusing an unrecognised `lsd.sh` or too little flash;
+- upgrading the first build: its own `sta-install.sh`, taken from git,
+  runs `install`, `conf` and `hook`, then this build's `install`,
+  `unhook` and `hook` follow.
+
+They establish nothing about the unit. The unit's `sed` and `grep` have
+not yet run the `=` line number and `-i -e` forms that `hook` uses.
+
+**Not known until the run:**
+- whether the block in `lsd.sh` runs at every start-up, as OpenSSH's does;
+- whether the unit's `sed` keeps `lsd.sh` byte for byte outside the
+  block;
+- the start-up timing with the wait for OpenSSH;
+- the bundled `jitter-egd` on a unit without OpenSSH. On this unit, the
+  OpenSSH one is always used.
+
 ## Phase 7.1 results
 
 One run on 2026-10-29, from 19:20 to 19:45 UTC (host clock; the unit's

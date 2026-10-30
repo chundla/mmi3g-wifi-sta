@@ -47,7 +47,9 @@ Passed on that unit, 2026-10-23 to 2026-10-30 (details and evidence in
   online POI search do not try the network ("No SIM card");
 - SSH from the phone that serves the hotspot;
 - a GEM button that starts the station, and a start-up choice that joins
-  the hotspot by itself about 3.5 minutes after power-on;
+  the hotspot by itself about 3.5 minutes after power-on (with the 7.6
+  hook; the 7.7 `lsd.sh` hook and the optional OpenSSH have not run on the
+  unit yet);
 - a restart brings the factory access point back.
 
 Not yet seen: a cold start in the car away from home, a start-up with the
@@ -78,12 +80,15 @@ by section name.
 
 ## Dependencies on the unit
 
-- **[qnx632-openssh](https://github.com/chundla/qnx632-openssh)**:
-  `jitter-egd` on `127.0.0.1:708`. The unit has no `/dev/urandom`, and
-  `wpa_supplicant` takes its nonces from it; without it the handshake
-  fails by design. `sta-mode.sh` also starts an `sshd` from `/mnt/ssh`
-  on the station's address, and the start-up hook is a line in that
-  repository's `start.sh`.
+- **`jitter-egd`** from [qnx632-openssh](https://github.com/chundla/qnx632-openssh)
+  on `127.0.0.1:708`. The unit has no `/dev/urandom`, and `wpa_supplicant`
+  takes its nonces from it; without it the handshake fails by design.
+  `sta-mode.sh` uses the OpenSSH installation's when it runs, and
+  otherwise starts the copy installed beside the station files.
+- **Optional: the OpenSSH installation** from qnx632-openssh. While it
+  runs, `sta-mode.sh` also starts an `sshd` from `/mnt/ssh` on the
+  station's address, and `sta-boot.sh` waits for it at start-up. Without
+  it the station has no SSH.
 - The factory `devnp-shim.so`, `dhcp.client`, `/dev/bpf` and `pf`.
 - For the wired management path: an AX88772B/C adapter, the
   `patch_asix_772b.py` device-table patch of the unit's own
@@ -127,21 +132,30 @@ to the ones `sta-install.sh` pins and that ran on the test unit:
 
 ## Installing
 
-The installation used on the test unit is described step by step in the
-notes: "The start button and persistent files (7.4b, 7.5)" and "Station
-mode at start-up (7.6)". In short, over SSH:
+The [MMI3G-Toolkit](https://github.com/dspl1236/MMI3G-Toolkit) `wifi-sta`
+module packages these files and runs the steps below from an SD card.
 
-1. `sta-install.sh install <dir>` puts the six station files,
-   `sta-mode.sh` and `sta-boot.sh` in `/mnt/persistence/wifi-sta` and
-   checks each against its pinned sum.
-2. `sta-install.sh conf < wpa-hotspot.conf` stores the hotspot's
-   configuration (mode 600). Generate it with `wpa_passphrase` so the unit
-   holds the derived key, not the passphrase.
-3. `gem-install.sh install <dir>` adds the `WifiClient` screen to the GEM
+By hand, the steps are described in the notes: "The start button and
+persistent files (7.4b, 7.5)", "Station mode at start-up (7.6)" and
+"Start-up from `lsd.sh`, OpenSSH optional (7.7)". In short, as root on the
+unit:
+
+1. `lan-mode.sh enable`, then a restart, if the factory LAN-mode flag
+   `/HBpersistence/DLinkReplacesPPP` is not already set.
+2. `sta-install.sh install <dir>` puts the binaries, the firmware,
+   `jitter-egd`, `sta-mode.sh`, `sta-boot.sh` and `boot-launch.sh` in
+   `/mnt/persistence/wifi-sta`, and checks each against its pinned sum.
+3. `sta-install.sh conf < wpa-hotspot.conf` stores the hotspot's
+   configuration (mode 600). Generate it with `wpa_passphrase`, so the
+   unit holds the derived key and not the passphrase.
+4. `gem-install.sh install <dir>` adds the `WifiClient` screen to the GEM
    and its button script to `/mnt/efs-persist/wifi-sta/gem`.
-4. `sta-install.sh hook` adds the start-up line (with its rollback).
+5. `sta-install.sh hook` adds the start-up block to the factory `lsd.sh`,
+   with its rollback.
 
-Every step has a `status` and a `remove`/`unhook`.
+Every step has a `status` and a `remove`/`unhook`. To upgrade the 7.6
+install, whose hook is a line in OpenSSH's `start.sh`, run `unhook`,
+`install` and `hook`.
 
 ## Licence
 
