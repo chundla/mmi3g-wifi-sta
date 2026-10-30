@@ -682,3 +682,19 @@ while :; do /bin/sleep 0.02; done
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class NoEval(unittest.TestCase):
+    """The unit's PD KSH 5.2.14 leaves its input source on an eval's freed
+    record for the rest of a top-level command, and a later built-in error
+    message then reads it (a start worker died of SIGSEGV on 2026-10-30).
+    The long-running scripts must not use eval at all."""
+
+    def test_no_eval_in_unit_scripts(self):
+        for name in ('wifi-sta/sta-mode.sh', 'wifi-sta/sta-boot.sh',
+                     'wifi-sta/boot-launch.sh', 'wifi-sta/gem/gem.sh'):
+            for number, line in enumerate(
+                    (ROOT / name).read_text().splitlines(), 1):
+                code = line.split('#', 1)[0]
+                self.assertNotRegex(code, r'(^|[;&|({ \t])eval([ \t]|$)',
+                                    f'{name}:{number}: {line.strip()}')

@@ -14,6 +14,7 @@ behaves the same.
 from pathlib import Path
 import getpass
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -38,6 +39,8 @@ SAVED_ENGDEFS = Path(os.environ.get('MMI_SAVED_ENGDEFS', '/nonexistent'))
 GEM_DIR = '/mnt/efs-persist/wifi-sta/gem'
 # The first published build, whose hook was a line in the OpenSSH start-up.
 FIRST_BUILD = '23b4255'
+# The build installed on the unit by the toolkit card on 2026-10-30.
+BUILD_7_7 = '11f7001'
 
 
 def cksum(path):
@@ -964,6 +967,32 @@ class StationInstaller(Base):
         self.assertEqual(out.returncode, 0, out.stdout)
         self.assertIn('BEGIN MMI WIFI-STA', self.lsd.read_text())
         self.assertIn('start-up block: in', self.run_script('status').stdout)
+
+    def test_the_7_7_build_is_upgraded_in_place(self):
+        """The 7.7 build, installed and hooked into lsd.sh (as on the unit
+        on 2026-10-30), differs only in sta-mode.sh, which had eval."""
+        out = subprocess.run(['git', '-C', str(ROOT), 'show', f'{BUILD_7_7}:wifi-sta/sta-mode.sh'],
+                             capture_output=True)
+        if out.returncode != 0:
+            self.skipTest('not a git checkout with the 7.7 build')
+        self.assertEqual(self.run_script('install', str(self.stage)).returncode, 0)
+        self.assertEqual(self.run_script('hook').returncode, 0)
+        lsd = self.lsd.read_text()
+        (self.top / 'sta-mode.sh').write_bytes(out.stdout)
+        old = cksum(self.top / 'sta-mode.sh')
+        self.assertEqual(old, '3337595432 45937')
+        sums = self.top / 'SUMS'
+        sums.write_text(re.sub(r'^\S+ \S+ sta-mode\.sh$', f'{old} sta-mode.sh',
+                               sums.read_text(), flags=re.M))
+        self.assertIn('state: older', self.run_script('status').stdout)
+        out = self.run_script('install', str(self.stage))
+        self.assertEqual(out.returncode, 0, out.stdout)
+        self.assertIn('(older)', out.stdout)
+        self.assertEqual(cksum(self.top / 'sta-mode.sh'), cksum(STA_MODE))
+        self.assertIn('state: installed', self.run_script('status').stdout)
+        out = self.run_script('hook')
+        self.assertEqual(out.returncode, 0, out.stdout)
+        self.assertEqual(self.lsd.read_text(), lsd)
 
     def test_remove_takes_out_an_older_builds_files(self):
         self.first_build()
