@@ -59,7 +59,9 @@ class ParserTests(unittest.TestCase):
     def parse(self, url):
         host = C.create_string_buffer(128)
         port, path = C.c_uint(), C.c_char_p()
-        rc = self.lib.nc_parse_url(url.encode(), host, C.byref(port), C.byref(path))
+        # path points into the URL, so the encoded URL must outlive the read.
+        raw = C.create_string_buffer(url.encode())
+        rc = self.lib.nc_parse_url(raw, host, C.byref(port), C.byref(path))
         return None if rc else (host.value.decode(), port.value, path.value.decode())
 
     def test_plain_http_urls_are_split(self):
