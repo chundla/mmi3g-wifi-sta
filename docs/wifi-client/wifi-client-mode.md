@@ -6605,11 +6605,21 @@ So 7.7 passes at home with OpenSSH installed:
 - the start-up join takes about 3 minutes 20 s to the verdict;
 - the GEM's start button works after the `eval` fix.
 
-Not yet seen:
-- the bundled `jitter-egd` and the station without OpenSSH, on a unit;
-  this unit always uses OpenSSH's;
-- the car test: a cold start away from home, a start-up with the hotspot
-  off, and a long drive.
+Not yet seen: the bundled `jitter-egd` and the station without OpenSSH,
+on a unit. This unit always uses OpenSSH's.
+
+**The car test (owner report).** On 2026-10-31 the owner reported that
+all three of these worked, with the build above and the marker set:
+- a cold start in the car away from home;
+- a start-up with the hotspot off;
+- a long drive.
+
+Nothing was captured from those runs. The unit was not reachable while
+they ran, and `boot.log` on the HDD has not been read since. So the
+timings are not recorded, and neither is the path a start with the
+hotspot off took. That path should be `PARTIAL`, then the keeper joining
+once the phone appears. Nor is whether the keeper had to reconnect
+during the drive.
 
 ## Hazards specific to this unit
 
@@ -6943,8 +6953,9 @@ Phases 0–1 change nothing on the unit.
    start-up block in `lsd.sh` with OpenSSH optional, installed from the
    MMI3G-Toolkit card and [passed at home](#phase-77-results) on
    2026-10-31, after a fix for a crash of the unit's `ksh` that broke the
-   GEM's start button. The join now takes about 3 minutes 20 s. Next is
-   the car test, from a cold start.
+   GEM's start button. The join now takes about 3 minutes 20 s. The owner
+   then reported the car test working: a cold start away from home, a
+   start-up with the hotspot off and a long drive (not logged).
 
 ## Not established
 

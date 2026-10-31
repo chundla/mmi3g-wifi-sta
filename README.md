@@ -53,8 +53,9 @@ Passed on that unit, 2026-10-23 to 2026-10-30 (details and evidence in
   `wifi-sta` module;
 - a restart brings the factory access point back.
 
-Not yet seen: a cold start in the car away from home, a start-up with the
-hotspot off and behaviour over a long drive. Broadcast frames are lost (about 40 % at
+In the car, the owner reported a cold start away from home, a start-up
+with the hotspot off and a long drive all working (2026-10-31; not
+logged). Broadcast frames are lost (about 40 % at
 times) while the car's Bluetooth streams audio; unicast is unaffected.
 
 **Station mode removes the car's access point** until the next restart:
