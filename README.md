@@ -47,14 +47,14 @@ Passed on that unit, 2026-10-23 to 2026-10-30 (details and evidence in
   online POI search do not try the network ("No SIM card");
 - SSH from the phone that serves the hotspot;
 - a GEM button that starts the station, and a start-up choice that joins
-  the hotspot by itself about 3.5 minutes after power-on (with the 7.6
-  hook; the 7.7 `lsd.sh` hook and the optional OpenSSH have not run on the
-  unit yet);
+  the hotspot by itself about 3 minutes 20 s after power-on, started from
+  `lsd.sh` (7.7; the station without OpenSSH has not run on a unit yet);
+- an SD-card install and in-place upgrade through the MMI3G-Toolkit
+  `wifi-sta` module;
 - a restart brings the factory access point back.
 
 Not yet seen: a cold start in the car away from home, a start-up with the
-hotspot off, behaviour over a long drive, and why one start-up ended
-before the station started. Broadcast frames are lost (about 40 % at
+hotspot off and behaviour over a long drive. Broadcast frames are lost (about 40 % at
 times) while the car's Bluetooth streams audio; unicast is unaffected.
 
 **Station mode removes the car's access point** until the next restart:

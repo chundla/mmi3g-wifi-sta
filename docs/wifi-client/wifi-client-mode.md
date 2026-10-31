@@ -5992,6 +5992,9 @@ not yet run the `=` line number and `-i -e` forms that `hook` uses.
 - the bundled `jitter-egd` on a unit without OpenSSH. On this unit, the
   OpenSSH one is always used.
 
+The first three are answered in the [7.7 results](#phase-77-results); the
+fourth is still open.
+
 ## Phase 7.1 results
 
 One run on 2026-10-29, from 19:20 to 19:45 UTC (host clock; the unit's
@@ -6508,6 +6511,106 @@ Not yet seen:
   join when the phone appears;
 - whether the factory networking service reacts over a long drive.
 
+## Phase 7.7 results
+
+Runs on 2026-10-30 and 2026-10-31, at home, with the build installed by the
+MMI3G-Toolkit `wifi-sta` module's SD card (module from this repository at
+`11f7001`, then `0e27791`). Evidence is in `<private>/live-20261030-phase77/`:
+the card's install log, the owner's photos, the system log and core dump
+of the crash, and the start-up log. Unit clock times count from start-up.
+
+**The card install (7.7 build).** The toolkit's installer ran on the
+second insertion; the first left no log, so it never started. In order:
+- the card's files and the factory driver, `dhcp.client` and `dhcp-up`
+  matched;
+- the LAN-mode flag was already set;
+- `sta-install.sh status` found the 7.6 set `older` and its line in
+  OpenSSH's `start.sh`, so `unhook` ran first: `start.sh` went back to
+  `702352968 4246`;
+- `install` upgraded the set in place and kept the configuration;
+- the GEM screen was already this build's;
+- `hook` changed `lsd.sh` from `3047168123 11873` to `2750904050 12069`,
+  the block after line 6. A dry run here against the saved copy of this
+  unit's `lsd.sh` gave the same bytes, so the unit's `sed` and `grep`
+  forms behave as the host's for this edit;
+- about 570 KB of the HDD and 1 KB of `efs-system` were used.
+
+At every later start-up the `lsd.sh` block ran: `boot.log` has its
+"start-up" line at 8 to 10 s of uptime, about 90 s earlier than OpenSSH's
+hook ran it in 7.6.
+
+**"Start station now" crashed twice.** Both presses came about 2.5 to
+3 minutes after start-up. Each time the start's log stopped at "detaching
+uap0", and the follower reported "the worker … ended without a verdict"
+3 to 5 s later. `uap0` was gone and `en6` was never mounted, so the unit
+had no Wi-Fi until a restart. For the second press, a watcher started over
+`en5` saved the system log as soon as the worker ended. It shows:
+
+```text
+00:03:14  run fault pid 3752026 tid 1 signal 11 code 1 ip 0x7034e148 mnt/ifs-root/bin/ksh
+00:03:15  core dumped for pid 3752026
+```
+
+The factory `dumper` keeps cores in `/HBpersistence/core/`. The core puts
+the fault in `strcmp` in `libc.so.2` (offset `0x4e148`), called from
+`ksh` at `0x080540e6`. That is PD KSH v5.2.14's `error_prefix`, which
+compares `source->file` with the script name before printing a built-in's
+error. `source->file` was `0x00050008`, not a pointer.
+
+The cause, from the pdksh 5.2.14 source and one check on the unit: `eval`
+runs its words through `shell()`, which leaves the shell's current input
+source pointing at the eval's temporary record. Only the next top-level
+command resets it. On the unit, a `kill -0` error after a function's
+`eval` prints without the script's `[line]` prefix, which shows the
+switch. A worker is one top-level command that runs until the restart,
+and `load_lock` began it with an `eval`. Once that record's memory was
+reused, the next built-in error read a freed pointer. Here that was the
+`kill -0` in `bounded` when `ifconfig uap0 destroy` ended. Whether the
+memory had been reused depends on what ran before, which is why the same
+start passed over SSH (once, at 4:37 of uptime, with tracing). The 7.3
+stop worker that vanished, and 7.6's start-up 4, which ended before
+`sta-mode.sh start` returned, fit the same cause. Neither left evidence,
+so this is not shown for them.
+
+`0e27791` writes and reads the lock one variable at a time. There is now
+no `eval` in `sta-mode.sh`, and a host test keeps it out of the scripts
+that run on the unit. `sta-install.sh` pins the new `sta-mode.sh`
+(`2285213847 47091`, installer `2674971188 19774`) and upgrades the 7.7
+one as `older`. The toolkit card with that build upgraded the unit in
+place. The same press, about 3 minutes after start-up, then gave verdict
+`OK`: `uap0` gone in 2 s, associated in 15 s, lease and `sshd` 15 s
+later. The system log had no fault and no new core.
+
+**Start-up join, then back to the access point.** With the marker set,
+`en5` unplugged and the hotspot on:
+
+| Time | Step |
+|---|---|
+| 00:00:10 | `lsd.sh` block; mode hotspot client |
+| 00:01:23 | "OpenSSH is up (waited 10s)", after `uap0` had its address; 60 s wait |
+| 00:02:24 | `sta-mode.sh start` |
+| 00:02:33 | `uap0` gone |
+| 00:02:54 | Associated |
+| 00:03:10 | Lease `172.20.10.13/28` |
+| 00:03:20 | Verdict `OK`; "Station status" showed `status OK` |
+
+That is about 13 s sooner than 7.6's start-up 5. "Start-up: car access
+point" and a restart, with `en5` plugged in, brought `uap0` back with its
+factory MAC and `192.168.1.1`, and `boot.log` logged "car access point …
+nothing to do" at 00:00:13.
+
+So 7.7 passes at home with OpenSSH installed:
+- the toolkit card installs and upgrades;
+- the `lsd.sh` block runs at every start-up;
+- the start-up join takes about 3 minutes 20 s to the verdict;
+- the GEM's start button works after the `eval` fix.
+
+Not yet seen:
+- the bundled `jitter-egd` and the station without OpenSSH, on a unit;
+  this unit always uses OpenSSH's;
+- the car test: a cold start away from home, a start-up with the hotspot
+  off, and a long drive.
+
 ## Hazards specific to this unit
 
 - **Loss of access.** SSH and Telnet both depend on `uap0`. The chip runs one
@@ -6835,8 +6938,13 @@ Phases 0–1 change nothing on the unit.
    [7.6](#station-mode-at-start-up-76-prepared-offline) was prepared and
    [passed at home](#phase-76-results): the unit joins the hotspot by
    itself about 3.5 minutes after power-on, and the GEM switches back to
-   the access point through a restart. Next is the car test, from a cold
-   start.
+   the access point through a restart.
+   [7.7](#start-up-from-lsdsh-openssh-optional-77-prepared-offline), the
+   start-up block in `lsd.sh` with OpenSSH optional, installed from the
+   MMI3G-Toolkit card and [passed at home](#phase-77-results) on
+   2026-10-31, after a fix for a crash of the unit's `ksh` that broke the
+   GEM's start button. The join now takes about 3 minutes 20 s. Next is
+   the car test, from a cold start.
 
 ## Not established
 
