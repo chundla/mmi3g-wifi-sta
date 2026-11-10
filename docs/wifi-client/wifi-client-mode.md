@@ -1,5 +1,10 @@
 # Wi-Fi client (station) mode
 
+> **Current guidance (2026-11-09):** use [operations](../operations.md),
+> [architecture](../architecture.md), [platform rules](../platform.md) and
+> [status](../status.md) for ongoing work. This log retains original plans,
+> commands, checksums and results; later phases can supersede earlier ones.
+
 > **About this copy.** These notes were written day by day in the author's
 > private MMI 3G research repository and copied here on 2026-10-30 with
 > the code. Revisions such as `11f5da6` refer to that repository. Paths

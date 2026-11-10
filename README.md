@@ -28,6 +28,13 @@ sta-mode.sh              start / status / stop, with a keeper that rejoins
 GEM screen               WifiClient.esd: status, start, start-up choice, back to AP
 ```
 
+## Contributor reading order
+
+Start with [AGENTS.md](AGENTS.md), then [platform constraints](docs/platform.md),
+[architecture and code map](docs/architecture.md), [current status](docs/status.md)
+and [operations](docs/operations.md). These guides are self-contained for
+contributors; the investigation log below preserves historical evidence.
+
 ## Status
 
 Tested on one unit only: **9411, HN+R_US_AU_K0942_3, MU 1038** (2012 Audi
